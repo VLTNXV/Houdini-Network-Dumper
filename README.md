@@ -48,7 +48,7 @@ copy the text from the pop-up window.
 If you'd rather not make a shelf tool, you can run the script directly:
 
 1. Save `network_dump.py` somewhere (e.g. `C:\temp\network_dump.py`).
-2. Open **Windows → Python Shell**.
+2. In Houdini open **Windows → Python Shell**.
 3. Run: `exec(open(r"C:\temp\network_dump.py").read())`
 
 (Pasting the full script line-by-line into the shell causes indentation
