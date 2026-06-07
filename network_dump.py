@@ -1,4 +1,6 @@
 import hou
+import re
+import traceback
 try:
     from PySide6 import QtWidgets, QtCore
 except ImportError:
@@ -12,44 +14,76 @@ except ImportError:
 
 ONLY_NON_DEFAULT = True
 
-REDACT_HINTS = ("filename", "user", "host", "email", "author", "license", "token", "$HOME")
+# Value patterns that look personal/sensitive. Redaction is VALUE-based:
+# we only blank out a value if the value itself matches one of these. We do
+# NOT redact based on parameter name alone, because that hides harmless,
+# useful data like group names ("top_pnt") and VEX snippets.
+#
+# Note: $HIP and other Houdini project variables are intentionally NOT
+# treated as personal — they're project-relative and useful for context.
+_PERSONAL_PATTERNS = (
+    r"[A-Za-z]:\\",                                      # Windows drive path  C:\  D:\
+    r"\\Users\\",                                        # Windows user dir
+    r"/Users/",                                          # macOS user dir
+    r"/home/",                                           # Linux user dir
+    r"\\\\[^\\]+\\",                                     # UNC path  \\server\share
+    r"\$HOME\b",                                         # $HOME var
+    r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",  # email address
+    r"\b[A-Za-z0-9]{40,}\b",                            # very long token-like strings
+)
+_PERSONAL_RE = re.compile("|".join(_PERSONAL_PATTERNS))
 
-def is_pathish(parm):
-    n = parm.name().lower()
-    return any(h in n for h in REDACT_HINTS)
 
 def looks_personal(val):
-    s = str(val)
-    return ("\\Users\\" in s or "/Users/" in s or "/home/" in s
-            or "C:\\" in s
-            or (s.count("@") == 1 and "." in s and " " not in s))
+    """True if the VALUE looks personal/sensitive."""
+    return bool(_PERSONAL_RE.search(str(val)))
 
-def redact(parm, val):
+
+def redact(val):
+    """Redact a value only if the value itself looks personal."""
     s = str(val)
     if looks_personal(s):
         return "<redacted-personal>"
     return s
+
 
 def parm_line(parm):
     try:
         try:
             expr = parm.expression()
             raw = parm.rawValue()
-        except hou.OperationFailed:
+        except Exception:
             expr = None
             raw = None
 
         if ONLY_NON_DEFAULT and parm.isAtDefault() and not expr:
             return None
 
+        # Tag user-defined (spare) parameters so HDA / promoted controls are
+        # distinguishable from a node's built-in parameters.
+        try:
+            spare = " [spare]" if parm.isSpare() else ""
+        except Exception:
+            spare = ""
+
         if expr:
-            lang = "py" if parm.expressionLanguage() == hou.exprLanguage.Python else "hscript"
-            return f"      {parm.name()} = [{lang} expr] {redact(parm, raw)}"
+            try:
+                lang = "py" if parm.expressionLanguage() == hou.exprLanguage.Python else "hscript"
+            except Exception:
+                lang = "expr"
+            # Redact the raw expression text AND its evaluated result, since an
+            # expression can evaluate to something sensitive even if its text isn't.
+            raw_red = redact(raw)
+            try:
+                eval_red = redact(parm.eval())
+            except Exception:
+                eval_red = "<eval-failed>"
+            return f"      {parm.name()}{spare} = [{lang} expr] {raw_red}  (-> {eval_red})"
         else:
-            val = parm.eval()
-            return f"      {parm.name()} = {redact(parm, val)}"
+            return f"      {parm.name()}{spare} = {redact(parm.eval())}"
     except Exception as e:
         return f"      {parm.name()} = <error: {e}>"
+
 
 def dump_node(node, all_selected_paths):
     out = []
@@ -72,6 +106,14 @@ def dump_node(node, all_selected_paths):
     if flags:
         out.append(f"  flags: {', '.join(flags)}")
 
+    # Node comment / annotation — useful intent signal if present.
+    try:
+        c = node.comment()
+        if c:
+            out.append(f"  comment: {redact(c)}")
+    except Exception:
+        pass
+
     inputs = node.inputs()
     if inputs:
         conns = []
@@ -93,6 +135,21 @@ def dump_node(node, all_selected_paths):
     except Exception:
         pass
 
+    # Outputs (including those going to nodes outside the selection), so the
+    # boundary of a partial selection is visible.
+    try:
+        outputs = node.outputs()
+        if outputs:
+            olines = []
+            for dst in outputs:
+                tag = "" if dst.path() in all_selected_paths else "  [outside selection]"
+                olines.append(f"    --> {dst.path()}{tag}")
+            if olines:
+                out.append("  outputs:")
+                out.extend(olines)
+    except Exception:
+        pass
+
     plines = []
     for parm in node.parms():
         line = parm_line(parm)
@@ -111,6 +168,7 @@ def dump_node(node, all_selected_paths):
 
     return "\n".join(out)
 
+
 def build_dump():
     sel = hou.selectedNodes()
     if not sel:
@@ -125,6 +183,7 @@ def build_dump():
     except Exception:
         pass
     lines.append(f"Context: {sel[0].parent().path() if sel[0].parent() else '/'}")
+    lines.append("NOTE: redaction is best-effort. Eyeball the output before sharing publicly.")
     lines.append("=" * 70)
 
     for node in sorted(sel, key=lambda n: n.path()):
@@ -141,6 +200,7 @@ def build_dump():
     lines.append("=" * 70)
 
     return "\n".join(lines)
+
 
 # ----------------------------------------------------------------------
 # Pop-up window
@@ -176,8 +236,14 @@ class DumpWindow(QtWidgets.QWidget):
     def copy_to_clipboard(self):
         QtWidgets.QApplication.clipboard().setText(self.text_edit.toPlainText())
 
-# Keep a reference so the window isn't garbage-collected and closed instantly.
-_dump_text = build_dump()
+
+# Build the dump defensively so a failure still shows a window with the
+# traceback instead of silently doing nothing.
+try:
+    _dump_text = build_dump()
+except Exception:
+    _dump_text = "Network dump failed:\n\n" + traceback.format_exc()
+
 _dump_window = DumpWindow(_dump_text)
 _dump_window.setParent(hou.qt.mainWindow(), QtCore.Qt.Window)
 _dump_window.show()
